@@ -1,3 +1,4 @@
+
 package com.wizzai.app
 
 import android.app.*
@@ -5,10 +6,9 @@ import android.content.*
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Typeface
-import android.os.Build
-import android.os.IBinder
+import android.os.*
+import android.provider.Settings
 import android.view.*
-import android.view.inputmethod.InputMethodManager
 import android.widget.*
 import kotlinx.coroutines.*
 
@@ -21,16 +21,21 @@ class FloatingService : Service() {
     private var questionInput: EditText? = null
     private var panelParams: WindowManager.LayoutParams? = null
 
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private val serviceScope =
+        CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     private val ocrReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             val text = intent?.getStringExtra("ocr_text").orEmpty()
+
             if (text.isNotBlank()) {
                 questionInput?.setText(
-                    "Baca dan jelaskan isi layar berikut:\n\n$text"
+                    "Tolong baca dan jelaskan teks layar ini:\n\n$text"
                 )
-                answerView?.text = "Teks layar berhasil dimasukkan. Tekan Tanya AI."
+                answerView?.text =
+                    "OCR berhasil. Tekan Tanya AI untuk menganalisis teks."
+            } else {
+                answerView?.text = "Tidak ditemukan teks pada layar."
             }
         }
     }
@@ -55,7 +60,11 @@ class FloatingService : Service() {
         showPanel()
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    override fun onStartCommand(
+        intent: Intent?,
+        flags: Int,
+        startId: Int
+    ): Int {
         if (panel == null && bubble == null) showPanel()
         return START_STICKY
     }
@@ -92,8 +101,11 @@ class FloatingService : Service() {
         }
     }
 
-    private fun layoutParams(width: Int, height: Int): WindowManager.LayoutParams {
-        return WindowManager.LayoutParams(
+    private fun dp(value: Int): Int =
+        (value * resources.displayMetrics.density).toInt()
+
+    private fun params(width: Int, height: Int) =
+        WindowManager.LayoutParams(
             width,
             height,
             if (Build.VERSION.SDK_INT >= 26)
@@ -106,9 +118,9 @@ class FloatingService : Service() {
             gravity = Gravity.TOP or Gravity.START
             x = 30
             y = 150
-            softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+            softInputMode =
+                WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
         }
-    }
 
     private fun showPanel() {
         removeBubble()
@@ -138,7 +150,6 @@ class FloatingService : Service() {
         header.addView(title, LinearLayout.LayoutParams(0, 45, 1f))
         header.addView(minimize)
         header.addView(close)
-
         header.setOnTouchListener(makeDragListener())
 
         questionInput = EditText(this).apply {
@@ -160,10 +171,15 @@ class FloatingService : Service() {
         }
 
         val askButton = actionButton("Tanya AI")
+        val ocrButton = actionButton("OCR Layar")
         val clearButton = actionButton("Bersihkan")
 
         askButton.setOnClickListener {
             askGemini()
+        }
+
+        ocrButton.setOnClickListener {
+            openOcrPermission()
         }
 
         clearButton.setOnClickListener {
@@ -184,7 +200,9 @@ class FloatingService : Service() {
         container.addView(questionInput)
         addGap(container, 8)
         container.addView(askButton)
-        addGap(container, 4)
+        addGap(container, 5)
+        container.addView(ocrButton)
+        addGap(container, 5)
         container.addView(clearButton)
         addGap(container, 8)
 
@@ -200,16 +218,40 @@ class FloatingService : Service() {
             )
         )
 
-        val params = layoutParams(dp(310), WindowManager.LayoutParams.WRAP_CONTENT)
-        panelParams = params
+        val windowParams = params(
+            dp(310),
+            WindowManager.LayoutParams.WRAP_CONTENT
+        )
+
+        panelParams = windowParams
         panel = container
 
         try {
-            windowManager.addView(container, params)
+            windowManager.addView(container, windowParams)
         } catch (_: Exception) {
             panel = null
             stopSelf()
         }
+    }
+
+    private fun openOcrPermission() {
+        if (!Settings.canDrawOverlays(this)) {
+            answerView?.text =
+                "Aktifkan izin tampil di atas aplikasi lain terlebih dahulu."
+            return
+        }
+
+        answerView?.text =
+            "Silakan setujui izin tangkapan layar pada halaman berikutnya."
+
+        val intent = Intent(this, MainActivity::class.java).apply {
+            action = MainActivity.ACTION_START_OCR
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or
+                Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
+
+        startActivity(intent)
     }
 
     private fun askGemini() {
@@ -228,7 +270,8 @@ class FloatingService : Service() {
                     answerView?.text = partial
                 }
             } catch (e: Exception) {
-                answerView?.text = "Gagal: ${e.message ?: "Terjadi kesalahan"}"
+                answerView?.text =
+                    "Gagal: ${e.message ?: "Terjadi kesalahan"}"
             }
         }
     }
@@ -244,17 +287,17 @@ class FloatingService : Service() {
             setTextColor(Color.WHITE)
             setBackgroundColor(Color.rgb(45, 105, 210))
             elevation = 15f
-            setOnClickListener { showPanel() }
             setOnTouchListener(makeBubbleDragListener())
         }
 
-        val params = layoutParams(dp(58), dp(58))
-        params.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-
         bubble = bubbleView
 
+        val bubbleParams = params(dp(58), dp(58)).apply {
+            flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+        }
+
         try {
-            windowManager.addView(bubbleView, params)
+            windowManager.addView(bubbleView, bubbleParams)
         } catch (_: Exception) {
             bubble = null
             stopSelf()
@@ -269,23 +312,25 @@ class FloatingService : Service() {
             var touchY = 0f
 
             override fun onTouch(view: View, event: MotionEvent): Boolean {
-                val params = panelParams ?: return false
+                val p = panelParams ?: return false
 
                 when (event.action) {
                     MotionEvent.ACTION_DOWN -> {
-                        startX = params.x
-                        startY = params.y
+                        startX = p.x
+                        startY = p.y
                         touchX = event.rawX
                         touchY = event.rawY
                         return true
                     }
 
                     MotionEvent.ACTION_MOVE -> {
-                        params.x = startX + (event.rawX - touchX).toInt()
-                        params.y = startY + (event.rawY - touchY).toInt()
+                        p.x = startX + (event.rawX - touchX).toInt()
+                        p.y = startY + (event.rawY - touchY).toInt()
 
                         try {
-                            panel?.let { windowManager.updateViewLayout(it, params) }
+                            panel?.let {
+                                windowManager.updateViewLayout(it, p)
+                            }
                         } catch (_: Exception) {
                         }
                         return true
@@ -305,12 +350,12 @@ class FloatingService : Service() {
             var moved = false
 
             override fun onTouch(view: View, event: MotionEvent): Boolean {
-                val params = view.layoutParams as WindowManager.LayoutParams
+                val p = view.layoutParams as WindowManager.LayoutParams
 
                 when (event.action) {
                     MotionEvent.ACTION_DOWN -> {
-                        startX = params.x
-                        startY = params.y
+                        startX = p.x
+                        startY = p.y
                         touchX = event.rawX
                         touchY = event.rawY
                         moved = false
@@ -321,15 +366,14 @@ class FloatingService : Service() {
                         val dx = (event.rawX - touchX).toInt()
                         val dy = (event.rawY - touchY).toInt()
 
-                        if (kotlin.math.abs(dx) > 8 || kotlin.math.abs(dy) > 8) {
-                            moved = true
-                        }
+                        if (kotlin.math.abs(dx) > 8 ||
+                            kotlin.math.abs(dy) > 8) moved = true
 
-                        params.x = startX + dx
-                        params.y = startY + dy
+                        p.x = startX + dx
+                        p.y = startY + dy
 
                         try {
-                            windowManager.updateViewLayout(view, params)
+                            windowManager.updateViewLayout(view, p)
                         } catch (_: Exception) {
                         }
                         return true
@@ -345,31 +389,26 @@ class FloatingService : Service() {
         }
     }
 
-    private fun actionButton(text: String): Button {
-        return Button(this).apply {
+    private fun actionButton(text: String) =
+        Button(this).apply {
             this.text = text
             isAllCaps = false
             setTextColor(Color.WHITE)
             setBackgroundColor(Color.rgb(45, 105, 210))
         }
-    }
 
-    private fun smallButton(text: String): TextView {
-        return TextView(this).apply {
+    private fun smallButton(text: String) =
+        TextView(this).apply {
             this.text = text
             textSize = 20f
             gravity = Gravity.CENTER
             setTextColor(Color.WHITE)
             setPadding(12, 4, 12, 4)
         }
-    }
 
     private fun addGap(layout: LinearLayout, height: Int) {
         layout.addView(View(this), LinearLayout.LayoutParams(1, height))
     }
-
-    private fun dp(value: Int): Int =
-        (value * resources.displayMetrics.density).toInt()
 
     private fun removePanel() {
         panel?.let {
@@ -393,10 +432,12 @@ class FloatingService : Service() {
 
     override fun onDestroy() {
         serviceScope.cancel()
+
         try {
             unregisterReceiver(ocrReceiver)
         } catch (_: Exception) {
         }
+
         removePanel()
         removeBubble()
         super.onDestroy()
