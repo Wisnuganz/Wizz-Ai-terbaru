@@ -1,3 +1,4 @@
+
 package com.wizzai.app
 
 import android.app.*
@@ -24,25 +25,42 @@ class ScreenCaptureService : Service() {
     private var imageReader: ImageReader? = null
     private var virtualDisplay: android.hardware.display.VirtualDisplay? = null
     private var captured = false
+    private var recognizerClosed = false
 
     private val handlerThread = HandlerThread("WizzScreenCapture")
+
     private lateinit var handler: Handler
+
+    private val projectionCallback =
+        object : MediaProjection.Callback() {
+            override fun onStop() {
+                stopSelf()
+            }
+        }
 
     override fun onCreate() {
         super.onCreate()
-
         handlerThread.start()
         handler = Handler(handlerThread.looper)
-
         createNotificationChannel()
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val resultCode = intent?.getIntExtra("result_code", Activity.RESULT_CANCELED)
-            ?: Activity.RESULT_CANCELED
+    override fun onStartCommand(
+        intent: Intent?,
+        flags: Int,
+        startId: Int
+    ): Int {
+
+        val resultCode = intent?.getIntExtra(
+            "result_code",
+            Activity.RESULT_CANCELED
+        ) ?: Activity.RESULT_CANCELED
 
         val resultData = if (Build.VERSION.SDK_INT >= 33) {
-            intent?.getParcelableExtra("result_data", Intent::class.java)
+            intent?.getParcelableExtra(
+                "result_data",
+                Intent::class.java
+            )
         } else {
             @Suppress("DEPRECATION")
             intent?.getParcelableExtra("result_data")
@@ -54,8 +72,8 @@ class ScreenCaptureService : Service() {
         }
 
         val notification = Notification.Builder(this, "wizz_screen")
-            .setContentTitle("Wizz AI - Screen OCR")
-            .setContentText("Mengambil teks layar setelah izin diberikan.")
+            .setContentTitle("Wizz AI OCR")
+            .setContentText("Sedang membaca teks layar.")
             .setSmallIcon(android.R.drawable.ic_menu_view)
             .setOngoing(true)
             .build()
@@ -64,7 +82,8 @@ class ScreenCaptureService : Service() {
             startForeground(
                 11,
                 notification,
-                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                android.content.pm.ServiceInfo
+                    .FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
             )
         } else {
             startForeground(11, notification)
@@ -72,30 +91,40 @@ class ScreenCaptureService : Service() {
 
         try {
             val manager = getSystemService(MEDIA_PROJECTION_SERVICE)
-                    as MediaProjectionManager
+                as MediaProjectionManager
 
             projection = manager.getMediaProjection(resultCode, resultData)
 
-            if (projection == null) {
+            val currentProjection = projection
+
+            if (currentProjection == null) {
+                sendResult("Gagal mendapatkan izin layar.")
                 stopSelf()
                 return START_NOT_STICKY
             }
 
-            startCapture()
+            // Wajib didaftarkan sebelum createVirtualDisplay.
+            currentProjection.registerCallback(
+                projectionCallback,
+                handler
+            )
+
+            startCapture(currentProjection)
+
         } catch (e: Exception) {
-            sendResult("Gagal memulai tangkapan layar: ${e.message}")
+            sendResult("Gagal memulai OCR: ${e.message}")
             stopSelf()
         }
 
         return START_NOT_STICKY
     }
 
-    private fun startCapture() {
+    private fun startCapture(currentProjection: MediaProjection) {
         val metrics = DisplayMetrics()
-        val windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+        val wm = getSystemService(WINDOW_SERVICE) as WindowManager
 
         @Suppress("DEPRECATION")
-        windowManager.defaultDisplay.getRealMetrics(metrics)
+        wm.defaultDisplay.getRealMetrics(metrics)
 
         val width = metrics.widthPixels
         val height = metrics.heightPixels
@@ -111,8 +140,12 @@ class ScreenCaptureService : Service() {
         imageReader?.setOnImageAvailableListener({ reader ->
             if (captured) return@setOnImageAvailableListener
 
-            val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+            val image = reader.acquireLatestImage()
+                ?: return@setOnImageAvailableListener
+
             captured = true
+
+            var bitmap: Bitmap? = null
 
             try {
                 val plane = image.planes[0]
@@ -129,7 +162,7 @@ class ScreenCaptureService : Service() {
 
                 fullBitmap.copyPixelsFromBuffer(buffer)
 
-                val bitmap = Bitmap.createBitmap(
+                bitmap = Bitmap.createBitmap(
                     fullBitmap,
                     0,
                     0,
@@ -138,28 +171,25 @@ class ScreenCaptureService : Service() {
                 )
 
                 fullBitmap.recycle()
-                image.close()
-
-                recognizeText(bitmap)
 
             } catch (e: Exception) {
-                try {
-                    image.close()
-                } catch (_: Exception) {
-                }
-
-                sendResult("Gagal membaca layar: ${e.message}")
+                sendResult("Gagal memproses gambar: ${e.message}")
                 stopSelf()
+            } finally {
+                image.close()
             }
+
+            bitmap?.let { recognizeText(it) }
 
         }, handler)
 
-        virtualDisplay = projection?.createVirtualDisplay(
-            "WizzAIScreen",
+        virtualDisplay = currentProjection.createVirtualDisplay(
+            "WizzAI-OCR",
             width,
             height,
             density,
-            android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+            android.hardware.display.DisplayManager
+                .VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             imageReader?.surface,
             null,
             handler
@@ -167,10 +197,10 @@ class ScreenCaptureService : Service() {
 
         handler.postDelayed({
             if (!captured) {
-                sendResult("Tidak berhasil mengambil layar. Coba ulangi.")
+                sendResult("Tidak berhasil mengambil layar. Silakan coba lagi.")
                 stopSelf()
             }
-        }, 8000)
+        }, 10000)
     }
 
     private fun recognizeText(bitmap: Bitmap) {
@@ -178,20 +208,28 @@ class ScreenCaptureService : Service() {
             TextRecognizerOptions.DEFAULT_OPTIONS
         )
 
-        val input = InputImage.fromBitmap(bitmap, 0)
+        recognizerClosed = false
 
-        recognizer.process(input)
+        recognizer.process(InputImage.fromBitmap(bitmap, 0))
             .addOnSuccessListener { result ->
-                val text = result.text
-                sendResult(text)
+                val text = result.text.trim()
+
+                if (text.isBlank()) {
+                    sendResult("")
+                } else {
+                    sendResult(text)
+                }
+
                 bitmap.recycle()
                 recognizer.close()
+                recognizerClosed = true
                 stopSelf()
             }
             .addOnFailureListener { error ->
                 sendResult("OCR gagal: ${error.message}")
                 bitmap.recycle()
                 recognizer.close()
+                recognizerClosed = true
                 stopSelf()
             }
     }
@@ -201,6 +239,7 @@ class ScreenCaptureService : Service() {
             setPackage(packageName)
             putExtra("ocr_text", text)
         }
+
         sendBroadcast(intent)
     }
 
@@ -221,6 +260,7 @@ class ScreenCaptureService : Service() {
         try {
             virtualDisplay?.release()
             imageReader?.close()
+            projection?.unregisterCallback(projectionCallback)
             projection?.stop()
         } catch (_: Exception) {
         }
