@@ -51,7 +51,7 @@ object GeminiClient {
 
         val url =
             "https://generativelanguage.googleapis.com/v1beta/models/" +
-            "gemini-2.5-flash:streamGenerateContent?alt=sse"
+            "gemini-3.8-flash:streamGenerateContent?alt=sse"
 
         val request = Request.Builder()
             .url(url)
