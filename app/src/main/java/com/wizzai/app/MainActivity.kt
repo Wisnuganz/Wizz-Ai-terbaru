@@ -1,280 +1,243 @@
 
 package com.wizzai.app
 
-import android.app.*
+import android.app.Activity
 import android.content.*
-import android.graphics.Bitmap
-import android.graphics.PixelFormat
-import android.media.ImageReader
-import android.media.projection.MediaProjection
+import android.graphics.Color
 import android.media.projection.MediaProjectionManager
-import android.os.*
-import android.util.DisplayMetrics
-import android.view.WindowManager
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.text.TextRecognition
-import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.provider.Settings
+import android.view.View
+import android.widget.*
 
-class ScreenCaptureService : Service() {
+class MainActivity : Activity() {
 
     companion object {
-        const val ACTION_OCR_RESULT = "com.wizzai.app.OCR_RESULT"
+        const val ACTION_START_OCR = "com.wizzai.app.START_OCR"
+        private const val SCREEN_REQUEST = 1001
     }
 
-    private var projection: MediaProjection? = null
-    private var imageReader: ImageReader? = null
-    private var virtualDisplay: android.hardware.display.VirtualDisplay? = null
-    private var captured = false
-    private var recognizerClosed = false
+    private lateinit var statusText: TextView
+    private lateinit var apiInput: EditText
 
-    private val handlerThread = HandlerThread("WizzScreenCapture")
+    private val ocrReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val text = intent?.getStringExtra("ocr_text").orEmpty()
+            statusText.text = if (text.isNotBlank()) {
+                "OCR berhasil membaca ${text.length} karakter."
+            } else {
+                "Tidak ditemukan teks pada layar."
+            }
+        }
+    }
 
-    private lateinit var handler: Handler
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
 
-    private val projectionCallback =
-        object : MediaProjection.Callback() {
-            override fun onStop() {
-                stopSelf()
+        window.statusBarColor = Color.rgb(16, 17, 20)
+        window.navigationBarColor = Color.rgb(16, 17, 20)
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(24, 32, 24, 24)
+            setBackgroundColor(Color.rgb(16, 17, 20))
+        }
+
+        val title = TextView(this).apply {
+            text = "Wizz AI"
+            textSize = 30f
+            setTextColor(Color.WHITE)
+        }
+
+        val subtitle = TextView(this).apply {
+            text = "Your floating AI assistant"
+            textSize = 14f
+            setTextColor(Color.LTGRAY)
+        }
+
+        apiInput = EditText(this).apply {
+            hint = "Masukkan Gemini API Key"
+            setHintTextColor(Color.GRAY)
+            setTextColor(Color.WHITE)
+            inputType = 129
+            setSingleLine(true)
+            setPadding(16, 12, 16, 12)
+            setBackgroundColor(Color.rgb(35, 37, 43))
+        }
+
+        apiInput.setText(
+            getSharedPreferences("wizz_settings", MODE_PRIVATE)
+                .getString("gemini_key", "")
+        )
+
+        statusText = TextView(this).apply {
+            text = "Status: Siap"
+            textSize = 14f
+            setTextColor(Color.LTGRAY)
+        }
+
+        val saveButton = makeButton("Simpan API Key")
+        val overlayButton = makeButton("Aktifkan Floating AI")
+        val ocrButton = makeButton("Aktifkan OCR Layar")
+        val stopButton = makeButton("Matikan Floating AI")
+
+        saveButton.setOnClickListener {
+            val key = apiInput.text.toString().trim()
+
+            if (key.isBlank()) {
+                apiInput.error = "API Key belum diisi"
+                return@setOnClickListener
+            }
+
+            getSharedPreferences("wizz_settings", MODE_PRIVATE)
+                .edit()
+                .putString("gemini_key", key)
+                .apply()
+
+            statusText.text = "API Key tersimpan."
+        }
+
+        overlayButton.setOnClickListener {
+            if (!Settings.canDrawOverlays(this)) {
+                startActivity(
+                    Intent(
+                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:$packageName")
+                    )
+                )
+            } else {
+                startFloating()
             }
         }
 
-    override fun onCreate() {
-        super.onCreate()
-        handlerThread.start()
-        handler = Handler(handlerThread.looper)
-        createNotificationChannel()
-    }
+        ocrButton.setOnClickListener {
+            requestScreenCapture()
+        }
 
-    override fun onStartCommand(
-        intent: Intent?,
-        flags: Int,
-        startId: Int
-    ): Int {
+        stopButton.setOnClickListener {
+            stopService(Intent(this, FloatingService::class.java))
+            statusText.text = "Floating AI dimatikan."
+        }
 
-        val resultCode = intent?.getIntExtra(
-            "result_code",
-            Activity.RESULT_CANCELED
-        ) ?: Activity.RESULT_CANCELED
+        root.addView(title)
+        root.addView(subtitle)
+        addSpace(root, 25)
+        root.addView(apiInput)
+        addSpace(root, 10)
+        root.addView(saveButton)
+        addSpace(root, 20)
+        root.addView(overlayButton)
+        addSpace(root, 10)
+        root.addView(ocrButton)
+        addSpace(root, 10)
+        root.addView(stopButton)
+        addSpace(root, 20)
+        root.addView(statusText)
 
-        val resultData = if (Build.VERSION.SDK_INT >= 33) {
-            intent?.getParcelableExtra(
-                "result_data",
-                Intent::class.java
-            )
+        setContentView(root)
+
+        val filter = IntentFilter(ScreenCaptureService.ACTION_OCR_RESULT)
+
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(ocrReceiver, filter, RECEIVER_NOT_EXPORTED)
         } else {
             @Suppress("DEPRECATION")
-            intent?.getParcelableExtra("result_data")
+            registerReceiver(ocrReceiver, filter)
         }
 
-        if (resultData == null || resultCode != Activity.RESULT_OK) {
-            stopSelf()
-            return START_NOT_STICKY
+        handleAction(intent)
+    }
+
+    private fun handleAction(intent: Intent?) {
+        if (intent?.action == ACTION_START_OCR) {
+            requestScreenCapture()
         }
+    }
 
-        val notification = Notification.Builder(this, "wizz_screen")
-            .setContentTitle("Wizz AI OCR")
-            .setContentText("Sedang membaca teks layar.")
-            .setSmallIcon(android.R.drawable.ic_menu_view)
-            .setOngoing(true)
-            .build()
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleAction(intent)
+    }
 
-        if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(
-                11,
-                notification,
-                android.content.pm.ServiceInfo
-                    .FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-            )
-        } else {
-            startForeground(11, notification)
-        }
-
+    private fun requestScreenCapture() {
         try {
             val manager = getSystemService(MEDIA_PROJECTION_SERVICE)
                 as MediaProjectionManager
 
-            projection = manager.getMediaProjection(resultCode, resultData)
-
-            val currentProjection = projection
-
-            if (currentProjection == null) {
-                sendResult("Gagal mendapatkan izin layar.")
-                stopSelf()
-                return START_NOT_STICKY
-            }
-
-            // Wajib didaftarkan sebelum createVirtualDisplay.
-            currentProjection.registerCallback(
-                projectionCallback,
-                handler
+            startActivityForResult(
+                manager.createScreenCaptureIntent(),
+                SCREEN_REQUEST
             )
-
-            startCapture(currentProjection)
-
         } catch (e: Exception) {
-            sendResult("Gagal memulai OCR: ${e.message}")
-            stopSelf()
+            statusText.text = "Gagal meminta izin layar: ${e.message}"
+        }
+    }
+
+    private fun startFloating() {
+        val serviceIntent = Intent(this, FloatingService::class.java)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(serviceIntent)
+        } else {
+            startService(serviceIntent)
         }
 
-        return START_NOT_STICKY
+        statusText.text = "Floating AI aktif."
     }
 
-    private fun startCapture(currentProjection: MediaProjection) {
-        val metrics = DisplayMetrics()
-        val wm = getSystemService(WINDOW_SERVICE) as WindowManager
-
-        @Suppress("DEPRECATION")
-        wm.defaultDisplay.getRealMetrics(metrics)
-
-        val width = metrics.widthPixels
-        val height = metrics.heightPixels
-        val density = metrics.densityDpi
-
-        imageReader = ImageReader.newInstance(
-            width,
-            height,
-            PixelFormat.RGBA_8888,
-            2
-        )
-
-        imageReader?.setOnImageAvailableListener({ reader ->
-            if (captured) return@setOnImageAvailableListener
-
-            val image = reader.acquireLatestImage()
-                ?: return@setOnImageAvailableListener
-
-            captured = true
-
-            var bitmap: Bitmap? = null
-
-            try {
-                val plane = image.planes[0]
-                val buffer = plane.buffer
-                val pixelStride = plane.pixelStride
-                val rowStride = plane.rowStride
-                val rowPadding = rowStride - pixelStride * width
-
-                val fullBitmap = Bitmap.createBitmap(
-                    width + rowPadding / pixelStride,
-                    height,
-                    Bitmap.Config.ARGB_8888
-                )
-
-                fullBitmap.copyPixelsFromBuffer(buffer)
-
-                bitmap = Bitmap.createBitmap(
-                    fullBitmap,
-                    0,
-                    0,
-                    width,
-                    height
-                )
-
-                fullBitmap.recycle()
-
-            } catch (e: Exception) {
-                sendResult("Gagal memproses gambar: ${e.message}")
-                stopSelf()
-            } finally {
-                image.close()
-            }
-
-            bitmap?.let { recognizeText(it) }
-
-        }, handler)
-
-        virtualDisplay = currentProjection.createVirtualDisplay(
-            "WizzAI-OCR",
-            width,
-            height,
-            density,
-            android.hardware.display.DisplayManager
-                .VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            imageReader?.surface,
-            null,
-            handler
-        )
-
-        handler.postDelayed({
-            if (!captured) {
-                sendResult("Tidak berhasil mengambil layar. Silakan coba lagi.")
-                stopSelf()
-            }
-        }, 10000)
+    private fun makeButton(label: String): Button {
+        return Button(this).apply {
+            text = label
+            isAllCaps = false
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.rgb(45, 105, 210))
+        }
     }
 
-    private fun recognizeText(bitmap: Bitmap) {
-        val recognizer = TextRecognition.getClient(
-            TextRecognizerOptions.DEFAULT_OPTIONS
-        )
+    private fun addSpace(layout: LinearLayout, height: Int) {
+        layout.addView(View(this), LinearLayout.LayoutParams(1, height))
+    }
 
-        recognizerClosed = false
+    @Deprecated("Deprecated in Android API")
+    override fun onActivityResult(
+        requestCode: Int,
+        resultCode: Int,
+        data: Intent?
+    ) {
+        super.onActivityResult(requestCode, resultCode, data)
 
-        recognizer.process(InputImage.fromBitmap(bitmap, 0))
-            .addOnSuccessListener { result ->
-                val text = result.text.trim()
-
-                if (text.isBlank()) {
-                    sendResult("")
-                } else {
-                    sendResult(text)
+        if (requestCode == SCREEN_REQUEST) {
+            if (resultCode == RESULT_OK && data != null) {
+                val serviceIntent = Intent(
+                    this,
+                    ScreenCaptureService::class.java
+                ).apply {
+                    putExtra("result_code", resultCode)
+                    putExtra("result_data", data)
                 }
 
-                bitmap.recycle()
-                recognizer.close()
-                recognizerClosed = true
-                stopSelf()
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(serviceIntent)
+                } else {
+                    startService(serviceIntent)
+                }
+
+                statusText.text = "Sedang membaca layar..."
+            } else {
+                statusText.text = "Izin OCR dibatalkan."
             }
-            .addOnFailureListener { error ->
-                sendResult("OCR gagal: ${error.message}")
-                bitmap.recycle()
-                recognizer.close()
-                recognizerClosed = true
-                stopSelf()
-            }
-    }
-
-    private fun sendResult(text: String) {
-        val intent = Intent(ACTION_OCR_RESULT).apply {
-            setPackage(packageName)
-            putExtra("ocr_text", text)
         }
-
-        sendBroadcast(intent)
-    }
-
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= 26) {
-            val channel = NotificationChannel(
-                "wizz_screen",
-                "Wizz AI Screen Capture",
-                NotificationManager.IMPORTANCE_LOW
-            )
-
-            getSystemService(NotificationManager::class.java)
-                .createNotificationChannel(channel)
-        }
-    }
-
-    private fun cleanup() {
-        try {
-            virtualDisplay?.release()
-            imageReader?.close()
-            projection?.unregisterCallback(projectionCallback)
-            projection?.stop()
-        } catch (_: Exception) {
-        }
-
-        virtualDisplay = null
-        imageReader = null
-        projection = null
     }
 
     override fun onDestroy() {
-        cleanup()
-        handlerThread.quitSafely()
+        try {
+            unregisterReceiver(ocrReceiver)
+        } catch (_: Exception) {
+        }
+
         super.onDestroy()
     }
-
-    override fun onBind(intent: Intent?): IBinder? = null
 }
